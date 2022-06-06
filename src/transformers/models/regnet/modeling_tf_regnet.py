@@ -14,11 +14,13 @@
 # limitations under the License.
 """ TesnorFlow RegNet model."""
 
-from typing import Optional, List, Dict
-from responses import activate
-import numpy as np
+import math
+from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import tensorflow as tf
+
+from responses import activate
 
 from ...activations_tf import ACT2FN
 from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
@@ -27,10 +29,9 @@ from ...modeling_tf_outputs import (
     TFBaseModelOutputWithPoolingAndNoAttention,
     TFImageClassifierOutputWithNoAttention,
 )
-from ...modeling_tf_utils import TFPreTrainedModel
+from ...modeling_tf_utils import TFPreTrainedModel, keras_serializable, unpack_inputs
 from ...utils import logging
 from .configuration_regnet import RegNetConfig
-import math
 
 
 logger = logging.get_logger(__name__)
@@ -94,7 +95,11 @@ class TFRegNetEmbeddings(tf.keras.layers.Layer):
     def __init__(self, config: RegNetConfig, **kwargs):
         super().__init__(**kwargs)
         self.embedder = TFRegNetConvLayer(
-            config.num_channels, config.embedding_size, kernel_size=3, stride=2, activation=config.hidden_act, name="embedder",
+            out_channels=config.embedding_size,
+            kernel_size=3,
+            stride=2,
+            activation=config.hidden_act,
+            name="embedder",
         )
 
     def call(self, hidden_state):
@@ -110,7 +115,9 @@ class TFRegNetShortCut(tf.keras.Sequential):
 
     def __init__(self, out_channels: int, stride: int = 2, **kwargs):
         super().__init__(**kwargs)
-        self.convolution = tf.keras.layers.Conv2D(filters=out_channels, kernel_size=1, strides=stride, use_bias=False, name="convolution")
+        self.convolution = tf.keras.layers.Conv2D(
+            filters=out_channels, kernel_size=1, strides=stride, use_bias=False, name="convolution"
+        )
         self.normalization = tf.keras.layers.BatchNormalization(name="normalization")
 
 
@@ -197,7 +204,7 @@ class TFRegNetSELayer(tf.keras.layers.Layer):
         self.pooler = TFAdaptiveAvgPool2D(output_shape=(1, 1), name="pooler")
         self.attention = [
             tf.keras.layers.Conv2D(filters=reduced_channels, kernel_size=1, activation="relu", name="attention.0"),
-            tf.keras.layers.Conv2D(filters=in_channels, kernel_size=1, activation="sigmoid", name="attention.1")
+            tf.keras.layers.Conv2D(filters=in_channels, kernel_size=1, activation="sigmoid", name="attention.1"),
         ]
 
     def call(self, hidden_state):
@@ -222,10 +229,12 @@ class TFRegNetXLayer(tf.keras.layers.Layer):
             TFRegNetShortCut(out_channels, stride=stride, name="shortcut") if should_apply_shortcut else tf.identity
         )
         # `self.layers` instead of `self.layer` because that is a reserved argument.
-        self.layers = [ 
+        self.layers = [
             TFRegNetConvLayer(out_channels, kernel_size=1, activation=config.hidden_act, name="layer.0"),
-            TFRegNetConvLayer(out_channels, stride=stride, groups=groups, activation=config.hidden_act, name="layer.1"),
-            TFRegNetConvLayer(out_channels, out_channels, kernel_size=1, activation=None, name="layer.2")
+            TFRegNetConvLayer(
+                out_channels, stride=stride, groups=groups, activation=config.hidden_act, name="layer.1"
+            ),
+            TFRegNetConvLayer(out_channels, out_channels, kernel_size=1, activation=None, name="layer.2"),
         ]
         self.activation = ACT2FN[config.hidden_act]
 
@@ -249,13 +258,17 @@ class TFRegNetYLayer(tf.keras.layers.Layer):
         should_apply_shortcut = in_channels != out_channels or stride != 1
         groups = max(1, out_channels // config.groups_width)
         self.shortcut = (
-            TFRegNetShortCut(in_channels, out_channels, stride=stride, name="shortcut") if should_apply_shortcut else tf.identity()
+            TFRegNetShortCut(out_channels, stride=stride, name="shortcut")
+            if should_apply_shortcut
+            else tf.identity
         )
-        self.layers = [ 
+        self.layers = [
             TFRegNetConvLayer(out_channels, kernel_size=1, activation=config.hidden_act, name="layer.0"),
-            TFRegNetConvLayer(out_channels, stride=stride, groups=groups, activation=config.hidden_act, name="layer.1"),
+            TFRegNetConvLayer(
+                out_channels, stride=stride, groups=groups, activation=config.hidden_act, name="layer.1"
+            ),
             TFRegNetSELayer(out_channels, reduced_channels=int(round(in_channels / 4)), name="layer.2"),
-            TFRegNetConvLayer(out_channels, kernel_size=1, activation=None, name="layer.3")
+            TFRegNetConvLayer(out_channels, kernel_size=1, activation=None, name="layer.3"),
         ]
         self.activation = ACT2FN[config.hidden_act]
 
@@ -275,26 +288,14 @@ class TFRegNetStage(tf.keras.layers.Layer):
     """
 
     def __init__(
-        self,
-        config: RegNetConfig,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 2,
-        depth: int = 2,
-        **kwargs
+        self, config: RegNetConfig, in_channels: int, out_channels: int, stride: int = 2, depth: int = 2, **kwargs
     ):
         super().__init__(**kwargs)
 
         layer = TFRegNetXLayer if config.layer_type == "x" else TFRegNetYLayer
-        self.layers = [ 
+        self.layers = [
             # downsampling is done in the first layer with stride of 2
-            layer(
-                config,
-                in_channels,
-                out_channels,
-                stride=stride,
-                name="layer.0"
-            ),
+            layer(config, in_channels, out_channels, stride=stride, name="layer.0"),
             *[layer(config, out_channels, out_channels, name=f"layer.{i+1}") for i in range(depth - 1)],
         ]
 
@@ -316,13 +317,12 @@ class TFRegNetEncoder(tf.keras.layers.Layer):
                 config.hidden_sizes[0],
                 stride=2 if config.downsample_in_first_stage else 1,
                 depth=config.depths[0],
-                name="stages.0"
+                name="stages.0",
             )
         )
         in_out_channels = zip(config.hidden_sizes, config.hidden_sizes[1:])
         for i, ((in_channels, out_channels), depth) in enumerate(zip(in_out_channels, config.depths[1:])):
             self.stages.append(TFRegNetStage(config, in_channels, out_channels, depth=depth, name=f"stages.{i+1}"))
-        
 
     def call(
         self, hidden_state: tf.Tensor, output_hidden_states: bool = False, return_dict: bool = True
@@ -342,6 +342,56 @@ class TFRegNetEncoder(tf.keras.layers.Layer):
             return tuple(v for v in [hidden_state, hidden_states] if v is not None)
 
         return TFBaseModelOutputWithNoAttention(last_hidden_state=hidden_state, hidden_states=hidden_states)
+
+
+@keras_serializable
+class TFRegNetMainLayer(tf.keras.layers.Layer):
+    config_class = RegNetConfig
+
+    def __init__(self, config, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config
+        self.embedder = TFRegNetEmbeddings(config, name="embedder")
+        self.encoder = TFRegNetEncoder(config, name="encoder")
+        self.pooler = TFAdaptiveAvgPool2D((1, 1), name="pooler")
+
+    def call(
+        self, pixel_values: tf.Tensor, output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None
+    ) -> TFBaseModelOutputWithPoolingAndNoAttention:
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # When running on CPU, `tf.keras.layers.Conv2D` doesn't support `NCHW` format.
+        # So change the input format from `NCHW` to `NHWC`.
+        # shape = (batch_size, in_height, in_width, in_channels=num_channels)
+        pixel_values = tf.transpose(pixel_values, perm=(0, 2, 3, 1))
+
+        embedding_output = self.embedder(pixel_values)
+
+        encoder_outputs = self.encoder(
+            embedding_output, output_hidden_states=output_hidden_states, return_dict=return_dict
+        )
+
+        last_hidden_state = encoder_outputs[0]
+        pooled_output = self.layernorm(self.pooler(last_hidden_state))
+
+        # Change to NCHW output format have uniformity in the modules
+        last_hidden_state = tf.transpose(last_hidden_state, perm=(0, 3, 1, 2))
+
+        # Change the other hidden state outputs to NCHW as well
+        if output_hidden_states:
+            hidden_states = tuple([tf.transpose(h, perm=(0, 3, 1, 2)) for h in encoder_outputs[1]])
+
+        if not return_dict:
+            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+
+        return TFBaseModelOutputWithPoolingAndNoAttention(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=hidden_states if output_hidden_states else encoder_outputs.hidden_states,
+        )
 
 
 class TFRegNetPreTrainedModel(TFPreTrainedModel):
@@ -392,6 +442,7 @@ class TFRegNetPreTrainedModel(TFPreTrainedModel):
         return self.call(inputs)
 
 
+# tbu
 REGNET_START_DOCSTRING = r"""
     This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass. Use it
     as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage and
@@ -425,12 +476,9 @@ class TFRegNetModel(TFRegNetPreTrainedModel):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.config = config
-        self.embedder = TFRegNetEmbeddings(config, name="embedder")
-        self.encoder = TFRegNetEncoder(config, name="encoder")
-        self.pooler = TFAdaptiveAvgPool2D((1, 1), name="pooler")
-        # Initialize weights and apply final processing
-        self.post_init()
+        self.regnet = TFRegNetMainLayer(config, name="regnet")
 
+    @unpack_inputs
     @add_start_docstrings_to_model_forward(REGNET_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         processor_class=_FEAT_EXTRACTOR_FOR_DOC,
@@ -441,30 +489,33 @@ class TFRegNetModel(TFRegNetPreTrainedModel):
         expected_output=_EXPECTED_OUTPUT_SHAPE,
     )
     def call(
-        self, pixel_values: tf.Tensor, output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None
-    ) -> TFBaseModelOutputWithPoolingAndNoAttention:
+        self,
+        pixel_values: tf.Tensor,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        training=False,
+    ) -> Union[TFBaseModelOutputWithPoolingAndNoAttention, Tuple[tf.Tensor]]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        embedding_output = self.embedder(pixel_values)
+        if pixel_values is None:
+            raise ValueError("You have to specify pixel_values")
 
-        encoder_outputs = self.encoder(
-            embedding_output, output_hidden_states=output_hidden_states, return_dict=return_dict
+        outputs = self.regnet(
+            pixel_values=pixel_values,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
         )
-
-        last_hidden_state = encoder_outputs[0]
-
-        pooled_output = self.pooler(last_hidden_state)
-
         if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+            return (outputs[0],) + outputs[1:]
 
         return TFBaseModelOutputWithPoolingAndNoAttention(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
+            last_hidden_state=outputs.last_hidden_state,
+            pooler_output=outputs.pooler_output,
+            hidden_states=outputs.hidden_states,
         )
 
 
@@ -479,15 +530,14 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.num_labels = config.num_labels
-        self.regnet = TFRegNetModel(config, name="regnet")
+        self.regnet = TFRegNetMainLayer(config, name="regnet")
         # classification head
-        self.classifier = tf.keras.Sequential([
+        self.classifier = [
             tf.keras.layers.Flatten(),
-            tf.keras.Dense(config.num_labels) if config.num_labels > 0 else tf.identity(),
-        ], name="classifier")
-        # initialize weights and apply final processing
-        self.post_init()
+            tf.keras.layers.Dense(config.num_labels, name="classifier.1") if config.num_labels > 0 else tf.identity,
+        ]
 
+    @unpack_inputs
     @add_start_docstrings_to_model_forward(REGNET_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         processor_class=_FEAT_EXTRACTOR_FOR_DOC,
@@ -508,6 +558,9 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
             config.num_labels - 1]`. If `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.regnet(pixel_values, output_hidden_states=output_hidden_states, return_dict=return_dict)
@@ -516,31 +569,10 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
 
         logits = self.classifier(pooled_output)
 
-        loss = None
-
-        if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == tf.float64 or labels.dtype == tf.int32):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-            if self.config.problem_type == "regression":
-                loss_fct = tf.keras.losses.MeanSquaredError()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = tf.keras.losses.CategoricalCrossentropy()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-                loss = loss_fct(logits, labels)
+        loss = None if labels is None else self.hf_compute_loss(labels=labels, logits=logits)
 
         if not return_dict:
             output = (logits,) + outputs[2:]
-            return (loss,) + output if loss is not None else output
+            return ((loss,) + output) if loss is not None else output
 
         return TFImageClassifierOutputWithNoAttention(loss=loss, logits=logits, hidden_states=outputs.hidden_states)
