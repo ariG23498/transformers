@@ -20,16 +20,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 
-from responses import activate
-
 from ...activations_tf import ACT2FN
 from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
 from ...modeling_tf_outputs import (
     TFBaseModelOutputWithNoAttention,
     TFBaseModelOutputWithPoolingAndNoAttention,
-    TFImageClassifierOutputWithNoAttention,
+    TFSequenceClassifierOutput,
 )
-from ...modeling_tf_utils import TFPreTrainedModel, keras_serializable, unpack_inputs
+from ...modeling_tf_utils import TFPreTrainedModel, keras_serializable, unpack_inputs, TFSequenceClassificationLoss
 from ...utils import logging
 from .configuration_regnet import RegNetConfig
 
@@ -81,7 +79,7 @@ class TFRegNetConvLayer(tf.keras.layers.Layer):
         self.activation = ACT2FN[activation] if activation is not None else tf.identity
 
     def call(self, hidden_state):
-        hidden_state = self.convolution(hidden_state)
+        hidden_state = self.convolution(self.padding(hidden_state))
         hidden_state = self.normalization(hidden_state)
         hidden_state = self.activation(hidden_state)
         return hidden_state
@@ -120,6 +118,8 @@ class TFRegNetShortCut(tf.keras.Sequential):
         )
         self.normalization = tf.keras.layers.BatchNormalization(name="normalization")
 
+    def call(self, inputs):
+        return self.normalization(self.convolution(inputs))
 
 # Copied from:
 # https://gist.github.com/Rocketknight1/43abbe6e73f1008e6e459486e01e0ceb
@@ -204,7 +204,7 @@ class TFRegNetSELayer(tf.keras.layers.Layer):
         self.pooler = TFAdaptiveAvgPool2D(output_shape=(1, 1), name="pooler")
         self.attention = [
             tf.keras.layers.Conv2D(filters=reduced_channels, kernel_size=1, activation="relu", name="attention.0"),
-            tf.keras.layers.Conv2D(filters=in_channels, kernel_size=1, activation="sigmoid", name="attention.1"),
+            tf.keras.layers.Conv2D(filters=in_channels, kernel_size=1, activation="sigmoid", name="attention.2"),
         ]
 
     def call(self, hidden_state):
@@ -295,8 +295,8 @@ class TFRegNetStage(tf.keras.layers.Layer):
         layer = TFRegNetXLayer if config.layer_type == "x" else TFRegNetYLayer
         self.layers = [
             # downsampling is done in the first layer with stride of 2
-            layer(config, in_channels, out_channels, stride=stride, name="layer.0"),
-            *[layer(config, out_channels, out_channels, name=f"layer.{i+1}") for i in range(depth - 1)],
+            layer(config, in_channels, out_channels, stride=stride, name="layers.0"),
+            *[layer(config, out_channels, out_channels, name=f"layers.{i+1}") for i in range(depth - 1)],
         ]
 
     def call(self, hidden_state):
@@ -375,7 +375,7 @@ class TFRegNetMainLayer(tf.keras.layers.Layer):
         )
 
         last_hidden_state = encoder_outputs[0]
-        pooled_output = self.layernorm(self.pooler(last_hidden_state))
+        pooled_output = self.pooler(last_hidden_state)
 
         # Change to NCHW output format have uniformity in the modules
         last_hidden_state = tf.transpose(last_hidden_state, perm=(0, 3, 1, 2))
@@ -526,7 +526,7 @@ class TFRegNetModel(TFRegNetPreTrainedModel):
     """,
     REGNET_START_DOCSTRING,
 )
-class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
+class TFRegNetForImageClassification(TFRegNetPreTrainedModel, TFSequenceClassificationLoss):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.num_labels = config.num_labels
@@ -542,7 +542,7 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
     @add_code_sample_docstrings(
         processor_class=_FEAT_EXTRACTOR_FOR_DOC,
         checkpoint=_IMAGE_CLASS_CHECKPOINT,
-        output_type=TFImageClassifierOutputWithNoAttention,
+        output_type=TFSequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
         expected_output=_IMAGE_CLASS_EXPECTED_OUTPUT,
     )
@@ -552,7 +552,7 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
         labels: tf.Tensor = None,
         output_hidden_states: bool = None,
         return_dict: bool = None,
-    ) -> TFImageClassifierOutputWithNoAttention:
+    ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
         r"""
         labels (`tf.Tensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
@@ -567,7 +567,8 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
 
         pooled_output = outputs.pooler_output if return_dict else outputs[1]
 
-        logits = self.classifier(pooled_output)
+        flattened_output = self.classifier[0](pooled_output)
+        logits = self.classifier[1](flattened_output)
 
         loss = None if labels is None else self.hf_compute_loss(labels=labels, logits=logits)
 
@@ -575,4 +576,4 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel):
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
-        return TFImageClassifierOutputWithNoAttention(loss=loss, logits=logits, hidden_states=outputs.hidden_states)
+        return TFSequenceClassifierOutput(loss=loss, logits=logits, hidden_states=outputs.hidden_states)
