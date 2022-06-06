@@ -75,7 +75,7 @@ class TFRegNetConvLayer(tf.keras.layers.Layer):
             use_bias=False,
             name="convolution",
         )
-        self.normalization = tf.keras.layers.BatchNormalization(name="normalization")
+        self.normalization = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.1, name="normalization")
         self.activation = ACT2FN[activation] if activation is not None else tf.identity
 
     def call(self, hidden_state):
@@ -116,7 +116,7 @@ class TFRegNetShortCut(tf.keras.Sequential):
         self.convolution = tf.keras.layers.Conv2D(
             filters=out_channels, kernel_size=1, strides=stride, use_bias=False, name="convolution"
         )
-        self.normalization = tf.keras.layers.BatchNormalization(name="normalization")
+        self.normalization = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.1, name="normalization")
 
     def call(self, inputs):
         return self.normalization(self.convolution(inputs))
@@ -356,7 +356,7 @@ class TFRegNetMainLayer(tf.keras.layers.Layer):
         self.pooler = TFAdaptiveAvgPool2D((1, 1), name="pooler")
 
     def call(
-        self, pixel_values: tf.Tensor, output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None
+        self, pixel_values: tf.Tensor, output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None, training: bool = False
     ) -> TFBaseModelOutputWithPoolingAndNoAttention:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -368,10 +368,10 @@ class TFRegNetMainLayer(tf.keras.layers.Layer):
         # shape = (batch_size, in_height, in_width, in_channels=num_channels)
         pixel_values = tf.transpose(pixel_values, perm=(0, 2, 3, 1))
 
-        embedding_output = self.embedder(pixel_values)
+        embedding_output = self.embedder(pixel_values, training=training)
 
         encoder_outputs = self.encoder(
-            embedding_output, output_hidden_states=output_hidden_states, return_dict=return_dict
+            embedding_output, output_hidden_states=output_hidden_states, return_dict=return_dict, training=training
         )
 
         last_hidden_state = encoder_outputs[0]
@@ -552,6 +552,7 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel, TFSequenceClassifi
         labels: tf.Tensor = None,
         output_hidden_states: bool = None,
         return_dict: bool = None,
+        training=False,
     ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
         r"""
         labels (`tf.Tensor` of shape `(batch_size,)`, *optional*):
@@ -563,7 +564,7 @@ class TFRegNetForImageClassification(TFRegNetPreTrainedModel, TFSequenceClassifi
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.regnet(pixel_values, output_hidden_states=output_hidden_states, return_dict=return_dict)
+        outputs = self.regnet(pixel_values, output_hidden_states=output_hidden_states, return_dict=return_dict, training=training)
 
         pooled_output = outputs.pooler_output if return_dict else outputs[1]
 
