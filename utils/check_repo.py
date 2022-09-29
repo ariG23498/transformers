@@ -163,8 +163,6 @@ IGNORE_NON_AUTO_CONFIGURED = PRIVATE_MODELS.copy() + [
     "GroupViTVisionModel",
     "TFCLIPTextModel",
     "TFCLIPVisionModel",
-    "TFGroupViTTextModel",
-    "TFGroupViTVisionModel",
     "FlaxCLIPTextModel",
     "FlaxCLIPVisionModel",
     "FlaxWav2Vec2ForCTC",
