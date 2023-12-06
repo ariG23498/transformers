@@ -1,26 +1,40 @@
+# coding=utf-8
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """ Keras 3.0 LLaMA model."""
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import keras
 
-ACT2FN = {
-    "gelu": keras.activations.gelu,
-    # "gelu_10": keras.activations.gelu_10,
-    # "gelu_fast": keras.activations.gelu_fast,
-    # "gelu_new": keras.activations.gelu_new,
-    # "glu": keras.activations.glu,
-    "mish": keras.activations.mish,
-    # "quick_gelu": keras.activations.quick_gelu,
-    "relu": keras.activations.relu,
-    "sigmoid": keras.activations.sigmoid,
-    "silu": keras.activations.silu,
-    "swish": keras.activations.swish,
-    "tanh": keras.activations.tanh,
-}
-
+from ...activations_keras import ACT2FN
+from ...utils import (
+    logging
+)
+# from ...keras_utils import ALL_LAYERNORM_LAYERS
 from .configuration_llama import LlamaConfig
+
+logger = logging.get_logger(__name__)
+
+_CONFIG_FOR_DOC = "LlamaConfig"
+
 
 class KerasLlamaRMSNorm(keras.layers.Layer):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
@@ -45,6 +59,9 @@ class KerasLlamaRMSNorm(keras.layers.Layer):
         return self.weight * keras.ops.cast(hidden_states, input_dtype)
 
 
+# ALL_LAYERNORM_LAYERS.append(KerasLlamaRMSNorm)
+
+
 class KerasLlamaRotaryEmbedding(keras.layers.Layer):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, **kwargs):
         super().__init__(**kwargs)
@@ -52,6 +69,7 @@ class KerasLlamaRotaryEmbedding(keras.layers.Layer):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        # TODO (ariG23498): use add_weight or constant to handle inv_freq
         self.inv_freq = 1.0 / (
             self.base ** (keras.ops.arange(start=0, stop=self.dim, step=2, dtype="float32") / dim)
         )
@@ -70,18 +88,25 @@ class KerasLlamaRotaryEmbedding(keras.layers.Layer):
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = keras.ops.concatenate((freqs, freqs), axis=-1)
         
-        self.cos_cached = keras.ops.cast(
-            keras.ops.cos(emb),
+        self.cos_cached = self.add_weight(
+            shape=keras.ops.shape(emb),
+            initializer="ones",
+            trainable=False,
             dtype=dtype,
+            name="cos_cached",
         )
-        self.sin_cached = keras.ops.cast(
-            keras.ops.sin(emb),
+        self.cos_cached.assign(keras.ops.cos(emb))
+        
+        self.sin_cached = self.add_weight(
+            shape=keras.ops.shape(emb),
+            initializer="ones",
+            trainable=False,
             dtype=dtype,
-        )        
+            name="sin_cached",
+        )
+        self.sin_cached.assign(keras.ops.sin(emb))
 
     def call(self, x, seq_len=None):
-        # TODO (ariG23498): seq_len is None by default, should be handled
-        # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
@@ -92,33 +117,12 @@ class KerasLlamaRotaryEmbedding(keras.layers.Layer):
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
-    return keras.ops.concatenate((-x2, x1), axis=-1)
+    return keras.ops.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
     cos = keras.ops.expand_dims(cos[position_ids], axis=unsqueeze_dim)
     sin = keras.ops.expand_dims(sin[position_ids], axis=unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -132,9 +136,9 @@ class KerasLlamaMLP(keras.layers.Layer):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = keras.layers.Dense(self.intermediate_size, bias=False)
-        self.up_proj = keras.layers.Dense(self.intermediate_size, bias=False)
-        self.down_proj = keras.layers.Dense(self.hidden_size, bias=False)
+        self.gate_proj = keras.layers.Dense(self.intermediate_size, bias=False, name="gate_proj")
+        self.up_proj = keras.layers.Dense(self.intermediate_size, bias=False, name="up_proj")
+        self.down_proj = keras.layers.Dense(self.hidden_size, bias=False, name="down_proj")
         self.act_fn = ACT2FN[config.hidden_act]
 
     def call(self, x):
@@ -164,10 +168,6 @@ class KerasLlamaMLP(keras.layers.Layer):
 
 
 def repeat_kv(hidden_states: keras.KerasTensor, n_rep: int) -> keras.KerasTensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
     batch, num_key_value_heads, slen, head_dim = keras.ops.shape(hidden_states)
     if n_rep == 1:
         return hidden_states
@@ -176,8 +176,6 @@ def repeat_kv(hidden_states: keras.KerasTensor, n_rep: int) -> keras.KerasTensor
 
 
 class KerasLlamaAttention(keras.layers.Layer):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
     def __init__(self, config: LlamaConfig, **kwargs):
         super().__init__(**kwargs)
         self.config = config
@@ -197,10 +195,10 @@ class KerasLlamaAttention(keras.layers.Layer):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.q_proj = keras.layers.Dense(self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = keras.layers.Dense(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.q_proj = keras.layers.Dense(self.num_heads * self.head_dim, bias=config.attention_bias, name="q_proj")
+        self.k_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias, name="k_proj")
+        self.v_proj = keras.layers.Dense(self.num_key_value_heads * self.head_dim, bias=config.attention_bias, name="v_proj")
+        self.o_proj = keras.layers.Dense(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias, name="o_proj")
         self._init_rope()
 
     def _init_rope(self):
@@ -336,23 +334,23 @@ class KerasLlamaAttention(keras.layers.Layer):
         return attn_output, attn_weights, past_key_value
 
 
-
 class KerasLlamaDecoderLayer(keras.layers.Layer):
     def __init__(self, config: LlamaConfig, **kwargs):
         super().__init__(**kwargs)
         self.config = config
         self.hidden_size = config.hidden_size
-        self.self_attn = KerasLlamaAttention(config)
-        self.mlp = KerasLlamaMLP(config)
+        self.self_attn = KerasLlamaAttention(config, name="self_attn")
+        self.mlp = KerasLlamaMLP(config, name="mlp")
         self.input_layer_norm = KerasLlamaRMSNorm(
             config.hidden_size,
-            eps=config.rms_norm_eps
+            eps=config.rms_norm_eps,
+            name="input_layer_norm"
         )
         self.post_attention_layernorm = KerasLlamaRMSNorm(
             config.hidden_size,
-            eps=config.rms_norm_eps
+            eps=config.rms_norm_eps,
+            name="post_attention_layernorm"
         )
-        
 
     def call(
         self,
@@ -364,19 +362,6 @@ class KerasLlamaDecoderLayer(keras.layers.Layer):
         use_cache: Optional[bool] = False,
         **kwargs,
         )-> Tuple[keras.KerasTensor, Optional[Tuple[keras.KerasTensor, keras.KerasTensor]]]:
-        """
-        Args:
-            hidden_states (`keras.KerasTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`keras.KerasTensor`, *optional*):
-                attention mask of size `(batch_size, 1, query_sequence_length, key_sequence_length)`
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_value (`Tuple(keras.KerasTensor)`, *optional*): cached past key and value projection states
-        """
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead."
@@ -413,3 +398,8 @@ class KerasLlamaDecoderLayer(keras.layers.Layer):
             outputs += (present_key_value,)
 
         return outputs
+
+# TODO (ariG23498): adding KerasPreTrainedModel
+class KerasLlamaPreTrainedModel(KerasPreTrainedModel):
+    config_class = LlamaConfig
+    base_model_prefix = "llama"
