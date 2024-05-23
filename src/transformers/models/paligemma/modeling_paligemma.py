@@ -346,7 +346,7 @@ class PaliGemmaForConditionalGeneration(PaliGemmaPreTrainedModel):
         else:
             causal_mask = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(-1)
             causal_mask = causal_mask.to(dtype).expand(-1, self.config.text_config.num_key_value_heads, -1, -1)
-            final_labels = None
+            final_labels = labels
         return final_embedding, causal_mask, final_labels, position_ids
 
     @add_start_docstrings_to_model_forward(PALIGEMMA_INPUTS_DOCSTRING)
