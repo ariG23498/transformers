@@ -14,7 +14,6 @@
 """Core helpers for loading model checkpoints."""
 
 from __future__ import annotations
-import time
 import math
 import os
 import re
@@ -1122,6 +1121,7 @@ def convert_and_load_state_dict_in_model(
     pattern_to_converter = {k: converter for converter in converters for k in converter.source_patterns}
 
     state_dict = sorted(state_dict.items(), key=lambda kv: dot_natural_key(kv[0]))
+
     for original_key, tensor in state_dict:
         # 1. Rename the key according to all renaming pattern and optional weight converter patterns
         renamed_key, source_pattern = rename_source_key(
@@ -1178,8 +1178,6 @@ def convert_and_load_state_dict_in_model(
                         else None
                     )
 
-                    t0 = time.time()
-                    torch.cuda.current_stream().synchronize()
                     future_or_tensor = spawn_tp_materialize(
                         thread_pool,
                         tensor,
@@ -1188,19 +1186,10 @@ def convert_and_load_state_dict_in_model(
                         device_map[""],
                         _dtype,
                     )
-                    torch.cuda.current_stream().synchronize()
-                    t1 = time.time()
-                    print(f"Loading time: {t1-t0}")
 
             if future_or_tensor is None:
                 param_device = get_device(device_map, renamed_key, valid_torch_device=True)
-                t0 = time.time()
-                torch.cuda.current_stream().synchronize()
                 future_or_tensor = spawn_materialize(thread_pool, tensor, param_device, _dtype)
-                torch.cuda.current_stream().synchronize()
-                t1 = time.time()
-                print(f"Loading time: {t1-t0}")
-
 
             mapping.add_tensor(renamed_key, original_key, source_pattern, future_or_tensor)
         elif source_pattern is not None:  # add all target keys as unexpected

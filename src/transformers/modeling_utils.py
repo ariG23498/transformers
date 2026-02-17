@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 import collections
 import copy
 import functools
@@ -4188,6 +4189,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             else:
                 raise ValueError("Neither a state dict nor checkpoint files were found.")
 
+
+            t0 = time.time()
+            torch.cuda.current_stream().synchronize()
             loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
                 model=model,
                 state_dict=merged_state_dict,
@@ -4195,6 +4199,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 tp_plan=model._tp_plan,
                 disk_offload_index=disk_offload_index,
             )
+
+
+            torch.cuda.current_stream().synchronize()
+            t1 = time.time()
+            print(f"Loading time: {t1-t0}")
 
             # finally close all opened file pointers
             for k in all_pointer:
