@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 import collections
 import copy
 import functools
@@ -5458,15 +5459,25 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             os.environ.get("HF_ENABLE_PARALLEL_LOADING", "").upper() in ENV_VARS_TRUE_VALUES
             and not is_deepspeed_zero3_enabled()
         ):
+            t0 = time.time()
+            torch.cuda.current_stream().synchronize()
             _error_msgs, disk_offload_index = load_shard_files_with_threadpool(args_list)
+            torch.cuda.current_stream().synchronize()
+            t1 = time.time()
+            print(f"Loading time: {t1-t0}")
             error_msgs += _error_msgs
         else:
             if len(args_list) > 1:
                 args_list = logging.tqdm(args_list, desc="Loading checkpoint shards")
 
+            t0 = time.time()
+            torch.cuda.current_stream().synchronize()
             for args in args_list:
                 _error_msgs, disk_offload_index = load_shard_file(args)
                 error_msgs += _error_msgs
+            torch.cuda.current_stream().synchronize()
+            t1 = time.time()
+            print(f"Loading time: {t1-t0}")
 
         # Save offloaded index if needed
         if disk_offload_index is not None and len(disk_offload_index) > 0 and not is_offloaded_safetensors:
