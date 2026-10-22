@@ -84,4 +84,5 @@ deps = {
     "libcst": "libcst",
     "rich": "rich",
     "ray[tune]": "ray[tune]>=2.7.0",
+    "requests": "requests",
 }
